@@ -112,8 +112,16 @@ class Player(val username: String) {
 /** username (normalized) -> Player. */
 private val players: MutableMap<String, Player> = ConcurrentHashMap()
 
-/** username (normalized) -> most recent captured mic frame (raw PCM) + capture time (ms). */
-private val voiceFrames: MutableMap<String, Pair<ByteArray, Long>> = ConcurrentHashMap()
+/** Most recent N frames kept per talker (~N*100ms of audio). A listener may poll
+ *  slower than a talker uploads (network RTT > the 100ms frame cadence), so we keep
+ *  a short backlog instead of a single slot and hand the listener every frame it has
+ *  not yet seen — otherwise frames are overwritten before they're fetched and the
+ *  audio drops out. */
+private const val MAX_BACKLOG = 12
+
+/** username (normalized) -> recent captured mic frames (raw PCM) + capture time (ms),
+ *  oldest first. Access is synchronized on the deque (one uploader, many listeners). */
+private val voiceFrames: MutableMap<String, ArrayDeque<Pair<ByteArray, Long>>> = ConcurrentHashMap()
 
 /** "listener|talker" (normalized) -> capture time of the last frame of that talker
  *  we served that listener, so each frame plays exactly once per listener instead of
@@ -339,13 +347,15 @@ fun main() {
                 val body = buildString {
                     append("GATE_RMS=").append(GATE_RMS).append('\n')
                     players.values.forEach { p ->
-                        val f = voiceFrames[p.username]
+                        val dq = voiceFrames[p.username]
+                        val last = dq?.let { synchronized(it) { it.lastOrNull() } }
                         append(p.username)
                             .append(" vol=").append(p.volume)
                             .append(" world=").append(p.worldId)
                             .append(" clan=").append(p.clanName)
                             .append(" rms=").append(p.lastRms.toInt())
-                            .append(" frame=").append(if (f == null) "none" else "${f.first.size}B age=${now - f.second}ms")
+                            .append(" backlog=").append(dq?.size ?: 0)
+                            .append(" frame=").append(if (last == null) "none" else "${last.first.size}B age=${now - last.second}ms")
                             .append('\n')
                     }
                 }
@@ -385,7 +395,11 @@ fun main() {
                 if (name != null && bytes.isNotEmpty()) {
                     // High-pass + noise-gate the frame before storing it.
                     val clean = denoise(player(name), bytes)
-                    voiceFrames[name] = clean to System.currentTimeMillis()
+                    val dq = voiceFrames.getOrPut(name) { ArrayDeque() }
+                    synchronized(dq) {
+                        dq.addLast(clean to System.currentTimeMillis())
+                        while (dq.size > MAX_BACKLOG) dq.removeFirst() // drop oldest
+                    }
                 }
                 call.respondText("ok")
             }
@@ -400,22 +414,46 @@ fun main() {
                     return@get
                 }
                 val now = System.currentTimeMillis()
-                val contributions = ArrayList<ByteArray>(talkers.size)
+                // Per talker, every frame this listener hasn't seen yet (and isn't
+                // stale), scaled by that talker's gain — oldest first. Polling slower
+                // than the 100ms upload cadence just yields several frames at once
+                // instead of dropping the ones overwritten between polls.
+                val backlogs = ArrayList<List<ByteArray>>(talkers.size)
                 for ((talker, gain) in talkers) {
-                    val frame = voiceFrames[talker.username] ?: continue
-                    if (now - frame.second > FRAME_STALE_MS) continue // stale
-                    // Serve each talker's frame at most once per listener, so audio
-                    // plays through instead of repeating the same syllable.
+                    val dq = voiceFrames[talker.username] ?: continue
                     val key = "$listener|${talker.username}"
-                    if (frame.second <= (lastServed[key] ?: 0L)) continue
-                    lastServed[key] = frame.second
-                    contributions.add(scalePcm16(frame.first, gain / 100.0))
+                    val since = lastServed[key] ?: 0L
+                    val fresh = ArrayList<ByteArray>()
+                    var newest = since
+                    synchronized(dq) {
+                        for ((frame, ts) in dq) {
+                            if (ts <= since || now - ts > FRAME_STALE_MS) continue
+                            fresh.add(scalePcm16(frame, gain / 100.0))
+                            if (ts > newest) newest = ts
+                        }
+                    }
+                    if (fresh.isNotEmpty()) {
+                        lastServed[key] = newest
+                        backlogs.add(fresh)
+                    }
                 }
-                if (contributions.isEmpty()) {
+                if (backlogs.isEmpty()) {
                     call.respond(HttpStatusCode.NoContent)
                     return@get
                 }
-                call.respondBytes(mixPcm16(contributions), ContentType.Application.OctetStream)
+                // Concatenate frame slots; within each slot mix the talkers. Backlogs
+                // are right-aligned (newest frames coincide) so simultaneous talkers
+                // stay in sync when their backlogs differ in length.
+                val slots = backlogs.maxOf { it.size }
+                val out = java.io.ByteArrayOutputStream()
+                for (i in 0 until slots) {
+                    val slice = backlogs.mapNotNull { b ->
+                        val idx = i - (slots - b.size)
+                        if (idx in b.indices) b[idx] else null
+                    }
+                    if (slice.isNotEmpty()) out.write(mixPcm16(slice))
+                }
+                call.respondBytes(out.toByteArray(), ContentType.Application.OctetStream)
             }
             get("/health") {
                 call.respondText("ok")
