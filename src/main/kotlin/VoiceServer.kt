@@ -11,11 +11,83 @@ import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
+import io.github.jaredmdobson.OpusApplication
+import io.github.jaredmdobson.OpusDecoder
+import io.github.jaredmdobson.OpusEncoder
+import io.github.jaredmdobson.OpusSignal
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+
+// --- Opus codec (Concentus, pure JVM) -----------------------------------------
+// The wire carries raw 16 kHz/16-bit PCM compressed with Opus. A "chunk" (any run
+// of PCM) is sent as a stream of length-prefixed 20 ms Opus packets:
+//   [2-byte big-endian length][opus bytes] ... repeated.
+// 20 ms is a valid Opus frame at 16 kHz (320 samples); 100 ms is not, hence the
+// sub-framing. Encoder/decoder state is per continuous stream (per talker uplink,
+// per listener downlink), so callers keep one of each and reuse it.
+private const val OPUS_FS = 16000
+private const val OPUS_SUBFRAME = 320 // samples = 20 ms @ 16 kHz
+
+private fun newOpusEncoder(): OpusEncoder =
+    OpusEncoder(OPUS_FS, 1, OpusApplication.OPUS_APPLICATION_VOIP).apply {
+        setBitrate(24000)
+        setComplexity(5)
+        setSignalType(OpusSignal.OPUS_SIGNAL_VOICE)
+        setUseInbandFEC(true)
+        setPacketLossPercent(10)
+    }
+
+private fun newOpusDecoder(): OpusDecoder = OpusDecoder(OPUS_FS, 1)
+
+/** Encode 16-bit LE PCM into length-prefixed 20 ms Opus packets. Drops a trailing
+ *  partial sub-frame (< 20 ms). */
+private fun opusEncode(enc: OpusEncoder, pcm: ByteArray): ByteArray {
+    val out = ByteArrayOutputStream(pcm.size / 8)
+    val shorts = ShortArray(OPUS_SUBFRAME)
+    val buf = ByteArray(1275)
+    val totalSamples = pcm.size / 2
+    var s = 0
+    while (s + OPUS_SUBFRAME <= totalSamples) {
+        for (k in 0 until OPUS_SUBFRAME) {
+            val i = (s + k) * 2
+            shorts[k] = ((pcm[i].toInt() and 0xFF) or (pcm[i + 1].toInt() shl 8)).toShort()
+        }
+        val n = enc.encode(shorts, 0, OPUS_SUBFRAME, buf, 0, buf.size)
+        out.write((n shr 8) and 0xFF)
+        out.write(n and 0xFF)
+        out.write(buf, 0, n)
+        s += OPUS_SUBFRAME
+    }
+    return out.toByteArray()
+}
+
+/** Decode a stream of length-prefixed Opus packets back to 16-bit LE PCM. */
+private fun opusDecode(dec: OpusDecoder, data: ByteArray): ByteArray {
+    val out = ByteArrayOutputStream(data.size * 8)
+    val pcm = ShortArray(OPUS_SUBFRAME)
+    var p = 0
+    while (p + 2 <= data.size) {
+        val len = ((data[p].toInt() and 0xFF) shl 8) or (data[p + 1].toInt() and 0xFF)
+        p += 2
+        if (len <= 0 || p + len > data.size) break
+        val n = dec.decode(data, p, len, pcm, 0, OPUS_SUBFRAME, false)
+        p += len
+        for (k in 0 until n) {
+            val v = pcm[k].toInt()
+            out.write(v and 0xFF)
+            out.write((v shr 8) and 0xFF)
+        }
+    }
+    return out.toByteArray()
+}
+
+/** Per-talker uplink decoder and per-listener downlink encoder (each a continuous stream). */
+private val opusDecoders: MutableMap<String, OpusDecoder> = ConcurrentHashMap()
+private val opusEncoders: MutableMap<String, OpusEncoder> = ConcurrentHashMap()
 
 /** voiceOverVolume value (0-49) at which the mic is at full strength; 0 = muted. */
 private const val MIC_FULL = 49.0
@@ -332,7 +404,12 @@ fun main() {
                 call.respondText("ok")
             }
             delete("/icon/{name}") {
-                normalize(call.parameters["name"])?.let { players.remove(it) }
+                normalize(call.parameters["name"])?.let {
+                    players.remove(it)
+                    voiceFrames.remove(it)
+                    opusDecoders.remove(it)
+                    opusEncoders.remove(it)
+                }
                 call.respondText("ok")
             }
             get("/state") {
@@ -393,8 +470,14 @@ fun main() {
                 val name = normalize(call.parameters["name"])
                 val bytes = call.receiveStream().readBytes()
                 if (name != null && bytes.isNotEmpty()) {
-                    // High-pass + noise-gate the frame before storing it.
-                    val clean = denoise(player(name), bytes)
+                    // Opus-decode the uplink to PCM, then high-pass + noise-gate it.
+                    val dec = opusDecoders.getOrPut(name) { newOpusDecoder() }
+                    val pcm = synchronized(dec) { opusDecode(dec, bytes) }
+                    if (pcm.isEmpty()) {
+                        call.respondText("ok")
+                        return@post
+                    }
+                    val clean = denoise(player(name), pcm)
                     val dq = voiceFrames.getOrPut(name) { ArrayDeque() }
                     synchronized(dq) {
                         dq.addLast(clean to System.currentTimeMillis())
@@ -445,7 +528,7 @@ fun main() {
                 // are right-aligned (newest frames coincide) so simultaneous talkers
                 // stay in sync when their backlogs differ in length.
                 val slots = backlogs.maxOf { it.size }
-                val out = java.io.ByteArrayOutputStream()
+                val out = ByteArrayOutputStream()
                 for (i in 0 until slots) {
                     val slice = backlogs.mapNotNull { b ->
                         val idx = i - (slots - b.size)
@@ -453,7 +536,14 @@ fun main() {
                     }
                     if (slice.isNotEmpty()) out.write(mixPcm16(slice))
                 }
-                call.respondBytes(out.toByteArray(), ContentType.Application.OctetStream)
+                // Opus-encode the mixed PCM for this listener's downlink stream.
+                val enc = opusEncoders.getOrPut(listener) { newOpusEncoder() }
+                val body = synchronized(enc) { opusEncode(enc, out.toByteArray()) }
+                if (body.isEmpty()) {
+                    call.respond(HttpStatusCode.NoContent)
+                    return@get
+                }
+                call.respondBytes(body, ContentType.Application.OctetStream)
             }
             get("/health") {
                 call.respondText("ok")

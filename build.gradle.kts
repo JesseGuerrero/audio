@@ -18,6 +18,8 @@ dependencies {
     implementation("io.ktor:ktor-server-core:$ktorVersion")
     implementation("io.ktor:ktor-server-netty:$ktorVersion")
     implementation("ch.qos.logback:logback-classic:1.5.6")
+    // Pure-Java Opus codec (no native deps) — compress the mic/voice hops.
+    implementation("io.github.jaredmdobson:concentus:1.0.1")
 }
 
 kotlin {
