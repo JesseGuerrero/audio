@@ -55,7 +55,8 @@ private const val GATE_RELEASE = 0.0004
  *   GET    /audio/yup.wav[?listener=name]                   the voice clip, PCM-attenuated for the listener
  *   GET    /health                                          "ok"
  *
- * Config via env vars:
+ * Config via env vars or a `.env` file in the working directory:
+ *   VOICE_HOST  bind address (default 0.0.0.0 = all interfaces)
  *   VOICE_PORT  listen port  (default 8080)
  */
 
@@ -119,8 +120,27 @@ private val voiceFrames: MutableMap<String, Pair<ByteArray, Long>> = ConcurrentH
  *  being replayed until a newer one arrives. Keyed per talker now that we mix many. */
 private val lastServed: MutableMap<String, Long> = ConcurrentHashMap()
 
+/**
+ * Values loaded from a `.env` file in the working directory at startup (if present).
+ * Real environment variables always take precedence over `.env` entries.
+ */
+private val dotenv: Map<String, String> = run {
+    val f = java.io.File(".env")
+    if (!f.isFile) emptyMap()
+    else f.readLines()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() && !it.startsWith("#") && it.contains('=') }
+        .associate { line ->
+            val k = line.substringBefore('=').trim()
+            val v = line.substringAfter('=').trim().trim('"', '\'')
+            k to v
+        }
+}
+
+private fun cfg(key: String): String? = System.getenv(key) ?: dotenv[key]
+
 private fun env(key: String, default: Long): Long =
-    System.getenv(key)?.toLongOrNull() ?: default
+    cfg(key)?.toLongOrNull() ?: default
 
 private fun normalize(name: String?): String? =
     name?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
@@ -279,10 +299,11 @@ private fun denoise(p: Player, src: ByteArray): ByteArray {
 
 fun main() {
     val port = env("VOICE_PORT", 8080).toInt()
+    val host = cfg("VOICE_HOST") ?: "0.0.0.0"
 
-    println("[ktor_voice] starting on port $port")
+    println("[ktor_voice] starting on $host:$port")
 
-    embeddedServer(Netty, port = port) {
+    embeddedServer(Netty, host = host, port = port) {
         routing {
             // Per-tick player state: world, tile, voice level and clan name (?clan=).
             post("/update/{name}/{world}/{x}/{y}/{plane}/{volume}") {
