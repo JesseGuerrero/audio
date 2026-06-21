@@ -10,6 +10,7 @@ description = "Darkan voice/overhead-icon sync API server"
 
 repositories {
     mavenCentral()
+    maven { url = uri("https://maven.maxhenkel.de/repository/public") } // opus4j
 }
 
 val ktorVersion = "2.3.13"
@@ -18,8 +19,8 @@ dependencies {
     implementation("io.ktor:ktor-server-core:$ktorVersion")
     implementation("io.ktor:ktor-server-netty:$ktorVersion")
     implementation("ch.qos.logback:logback-classic:1.5.6")
-    // Pure-Java Opus codec (no native deps) — compress the mic/voice hops.
-    implementation("io.github.jaredmdobson:concentus:1.0.1")
+    // Native libopus (1.6.x) JNI binding — bundles natives for all platforms.
+    implementation("de.maxhenkel.opus4j:opus4j:2.1.0")
 }
 
 kotlin {

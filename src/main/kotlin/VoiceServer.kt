@@ -11,10 +11,8 @@ import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
-import io.github.jaredmdobson.OpusApplication
-import io.github.jaredmdobson.OpusDecoder
-import io.github.jaredmdobson.OpusEncoder
-import io.github.jaredmdobson.OpusSignal
+import de.maxhenkel.opus4j.OpusDecoder
+import de.maxhenkel.opus4j.OpusEncoder
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -33,22 +31,17 @@ private const val OPUS_FS = 16000
 private const val OPUS_SUBFRAME = 320 // samples = 20 ms @ 16 kHz
 
 private fun newOpusEncoder(): OpusEncoder =
-    OpusEncoder(OPUS_FS, 1, OpusApplication.OPUS_APPLICATION_VOIP).apply {
-        setBitrate(24000)
-        setComplexity(5)
-        setSignalType(OpusSignal.OPUS_SIGNAL_VOICE)
-        setUseInbandFEC(true)
-        setPacketLossPercent(10)
+    OpusEncoder(OPUS_FS, 1, OpusEncoder.Application.VOIP).apply {
+        setMaxPacketLossPercentage(10f) // bias toward loss-robust encoding
     }
 
-private fun newOpusDecoder(): OpusDecoder = OpusDecoder(OPUS_FS, 1)
+private fun newOpusDecoder(): OpusDecoder = OpusDecoder(OPUS_FS, 1).apply { setFrameSize(OPUS_SUBFRAME) }
 
 /** Encode 16-bit LE PCM into length-prefixed 20 ms Opus packets. Drops a trailing
  *  partial sub-frame (< 20 ms). */
 private fun opusEncode(enc: OpusEncoder, pcm: ByteArray): ByteArray {
     val out = ByteArrayOutputStream(pcm.size / 8)
     val shorts = ShortArray(OPUS_SUBFRAME)
-    val buf = ByteArray(1275)
     val totalSamples = pcm.size / 2
     var s = 0
     while (s + OPUS_SUBFRAME <= totalSamples) {
@@ -56,10 +49,10 @@ private fun opusEncode(enc: OpusEncoder, pcm: ByteArray): ByteArray {
             val i = (s + k) * 2
             shorts[k] = ((pcm[i].toInt() and 0xFF) or (pcm[i + 1].toInt() shl 8)).toShort()
         }
-        val n = enc.encode(shorts, 0, OPUS_SUBFRAME, buf, 0, buf.size)
-        out.write((n shr 8) and 0xFF)
-        out.write(n and 0xFF)
-        out.write(buf, 0, n)
+        val packet = enc.encode(shorts)
+        out.write((packet.size shr 8) and 0xFF)
+        out.write(packet.size and 0xFF)
+        out.write(packet)
         s += OPUS_SUBFRAME
     }
     return out.toByteArray()
@@ -68,18 +61,18 @@ private fun opusEncode(enc: OpusEncoder, pcm: ByteArray): ByteArray {
 /** Decode a stream of length-prefixed Opus packets back to 16-bit LE PCM. */
 private fun opusDecode(dec: OpusDecoder, data: ByteArray): ByteArray {
     val out = ByteArrayOutputStream(data.size * 8)
-    val pcm = ShortArray(OPUS_SUBFRAME)
     var p = 0
     while (p + 2 <= data.size) {
         val len = ((data[p].toInt() and 0xFF) shl 8) or (data[p + 1].toInt() and 0xFF)
         p += 2
         if (len <= 0 || p + len > data.size) break
-        val n = dec.decode(data, p, len, pcm, 0, OPUS_SUBFRAME, false)
+        val packet = data.copyOfRange(p, p + len)
         p += len
-        for (k in 0 until n) {
-            val v = pcm[k].toInt()
-            out.write(v and 0xFF)
-            out.write((v shr 8) and 0xFF)
+        val pcm = dec.decode(packet) ?: continue
+        for (v in pcm) {
+            val iv = v.toInt()
+            out.write(iv and 0xFF)
+            out.write((iv shr 8) and 0xFF)
         }
     }
     return out.toByteArray()
@@ -407,8 +400,8 @@ fun main() {
                 normalize(call.parameters["name"])?.let {
                     players.remove(it)
                     voiceFrames.remove(it)
-                    opusDecoders.remove(it)
-                    opusEncoders.remove(it)
+                    opusDecoders.remove(it)?.close()
+                    opusEncoders.remove(it)?.close()
                 }
                 call.respondText("ok")
             }
