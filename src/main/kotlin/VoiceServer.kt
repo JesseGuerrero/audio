@@ -19,6 +19,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import kotlin.math.tanh
 
 // --- Opus codec (Concentus, pure JVM) -----------------------------------------
 // The wire carries raw 16 kHz/16-bit PCM compressed with Opus. A "chunk" (any run
@@ -150,6 +151,9 @@ class Player(val username: String) {
     @Volatile var lastRms: Double = 0.0
     /** Time (ms) of the last above-threshold frame, for the gate hold. */
     var lastAboveMs: Long = 0
+    /** Automatic-gain-control multiplier, adapted slowly toward a target loudness so
+     *  quiet mics and loud music end up at a consistent level. */
+    var agcGain: Double = 1.0
     /** Names (normalized) this player has muted. Muting is mutual when scoring audio. */
     val mutedPlayers: MutableList<String> = CopyOnWriteArrayList()
 
@@ -370,6 +374,69 @@ private fun denoise(p: Player, src: ByteArray): ByteArray {
     return out
 }
 
+// --- Loudness normalization (AGC) + output limiter ---------------------------
+/** Target RMS each talker is normalized toward (0-32767 scale). */
+private val AGC_TARGET_RMS = env("VOICE_AGC_TARGET", 2500L).toDouble()
+/** Bounds on the AGC multiplier so we never over-amplify near-silence/noise. */
+private const val AGC_MIN_GAIN = 0.3
+private const val AGC_MAX_GAIN = 3.0
+/** How fast the AGC gain adapts per frame (small = smooth, no pumping). */
+private const val AGC_ADAPT = 0.08
+/** Soft-limiter ceiling (0-32767). Peaks compress smoothly toward this so the
+ *  output never blasts past a reasonable maximum. ~0.8 of full scale. */
+private val LIMITER_CEILING = env("VOICE_CEILING", 26000L).toDouble()
+
+/**
+ * Per-talker automatic gain control: slowly scale each source toward a consistent
+ * target loudness so a quiet mic and a loud music stream end up at similar levels.
+ * Gain only adapts while the signal is above the gate (real audio), and is bounded
+ * so silence/noise isn't amplified. Operates on 16-bit LE PCM.
+ */
+private fun agc(p: Player, src: ByteArray): ByteArray {
+    val n = src.size / 2
+    if (n == 0) return src
+    var sumSq = 0.0
+    var j = 0
+    while (j + 1 < src.size) {
+        val s = ((src[j].toInt() and 0xFF) or (src[j + 1].toInt() shl 8)).toDouble()
+        sumSq += s * s
+        j += 2
+    }
+    val rms = sqrt(sumSq / n)
+    if (rms > GATE_RMS) {
+        val target = (AGC_TARGET_RMS / rms).coerceIn(AGC_MIN_GAIN, AGC_MAX_GAIN)
+        p.agcGain += (target - p.agcGain) * AGC_ADAPT
+    }
+    if (p.agcGain in 0.99..1.01) return src
+    val out = src.copyOf()
+    j = 0
+    while (j + 1 < out.size) {
+        var s = (out[j].toInt() and 0xFF) or (out[j + 1].toInt() shl 8)
+        s = (s * p.agcGain).roundToInt().coerceIn(-32768, 32767)
+        out[j] = (s and 0xFF).toByte()
+        out[j + 1] = ((s shr 8) and 0xFF).toByte()
+        j += 2
+    }
+    return out
+}
+
+/**
+ * Soft brick-wall limiter on a mixed PCM frame: tanh-shapes samples toward
+ * ±LIMITER_CEILING so loud peaks compress gently (no harsh clipping) and the
+ * output can never exceed the ceiling — a safety cap so nobody gets blasted.
+ */
+private fun limit(pcm: ByteArray): ByteArray {
+    var j = 0
+    while (j + 1 < pcm.size) {
+        val s = ((pcm[j].toInt() and 0xFF) or (pcm[j + 1].toInt() shl 8)).toDouble()
+        val o = (LIMITER_CEILING * tanh(s / LIMITER_CEILING)).roundToInt().coerceIn(-32768, 32767)
+        pcm[j] = (o and 0xFF).toByte()
+        pcm[j + 1] = ((o shr 8) and 0xFF).toByte()
+        j += 2
+    }
+    return pcm
+}
+
 fun main() {
     val port = env("VOICE_PORT", 8080).toInt()
     val host = cfg("VOICE_HOST") ?: "0.0.0.0"
@@ -470,7 +537,7 @@ fun main() {
                         call.respondText("ok")
                         return@post
                     }
-                    val clean = denoise(player(name), pcm)
+                    val clean = agc(player(name), denoise(player(name), pcm))
                     val dq = voiceFrames.getOrPut(name) { ArrayDeque() }
                     synchronized(dq) {
                         dq.addLast(clean to System.currentTimeMillis())
@@ -529,9 +596,10 @@ fun main() {
                     }
                     if (slice.isNotEmpty()) out.write(mixPcm16(slice))
                 }
-                // Opus-encode the mixed PCM for this listener's downlink stream.
+                // Soft-limit the mix to the ceiling, then Opus-encode this listener's downlink.
+                val mixed = limit(out.toByteArray())
                 val enc = opusEncoders.getOrPut(listener) { newOpusEncoder() }
-                val body = synchronized(enc) { opusEncode(enc, out.toByteArray()) }
+                val body = synchronized(enc) { opusEncode(enc, mixed) }
                 if (body.isEmpty()) {
                     call.respond(HttpStatusCode.NoContent)
                     return@get
