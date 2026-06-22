@@ -377,11 +377,13 @@ private fun denoise(p: Player, src: ByteArray): ByteArray {
 // --- Loudness normalization (AGC) + output limiter ---------------------------
 /** Target RMS each talker is normalized toward (0-32767 scale). */
 private val AGC_TARGET_RMS = env("VOICE_AGC_TARGET", 2500L).toDouble()
-/** Bounds on the AGC multiplier so we never over-amplify near-silence/noise. */
-private const val AGC_MIN_GAIN = 0.3
-private const val AGC_MAX_GAIN = 3.0
-/** How fast the AGC gain adapts per frame (small = smooth, no pumping). */
-private const val AGC_ADAPT = 0.08
+/** Bounds on the AGC multiplier. Wide range so quiet passages are lifted hard and
+ *  loud ones pulled well down — tighter convergence toward the target loudness. */
+private val AGC_MIN_GAIN = (System.getenv("VOICE_AGC_MIN") ?: "0.15").toDouble()
+private val AGC_MAX_GAIN = (System.getenv("VOICE_AGC_MAX") ?: "6.0").toDouble()
+/** How fast the AGC gain adapts per frame. Higher = levels out faster (at some risk
+ *  of audible "breathing" on music), lower = gentler. Tunable via VOICE_AGC_ADAPT. */
+private val AGC_ADAPT = (System.getenv("VOICE_AGC_ADAPT") ?: "0.18").toDouble()
 /** Limiter ceiling (0-32767): output peaks are held below this. ~0.7 of full scale. */
 private val LIMITER_CEILING = env("VOICE_CEILING", 23000L).toDouble()
 // Smoothed peak-limiter coefficients (per sample @ 16 kHz). The peak follower rises
