@@ -326,6 +326,9 @@ private val GATE_RMS = env("VOICE_GATE", 150L).toDouble()
 /** Hold (ms): keep the gate open this long after the last above-threshold frame,
  *  so brief dips between syllables don't chop the speech. */
 private val GATE_HOLD_MS = env("VOICE_HOLD", 150L)
+/** A player counts as "currently speaking" (for the HIGH speaker icon) if their last
+ *  above-gate frame was within this window. Tunable via VOICE_SPEAK_WINDOW. */
+private val SPEAK_WINDOW_MS = env("VOICE_SPEAK_WINDOW", 400L)
 
 /**
  * Clean up a talker's raw 16-bit PCM frame in place: a one-pole high-pass to strip
@@ -584,8 +587,14 @@ fun main() {
                 call.respondText("ok")
             }
             get("/state") {
+                // "name volume speaking" per player; speaking=1 if they had an above-gate
+                // frame within SPEAK_WINDOW_MS (drives the HIGH speaker icon).
+                val now = System.currentTimeMillis()
                 val body = buildString {
-                    players.values.forEach { append(it.username).append(' ').append(it.volume).append('\n') }
+                    players.values.forEach {
+                        val speaking = if (now - it.lastAboveMs <= SPEAK_WINDOW_MS) 1 else 0
+                        append(it.username).append(' ').append(it.volume).append(' ').append(speaking).append('\n')
+                    }
                 }
                 call.respondText(body, ContentType.Text.Plain)
             }
