@@ -16,10 +16,10 @@ import de.maxhenkel.opus4j.OpusEncoder
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
-import kotlin.math.tanh
 
 // --- Opus codec (Concentus, pure JVM) -----------------------------------------
 // The wire carries raw 16 kHz/16-bit PCM compressed with Opus. A "chunk" (any run
@@ -382,9 +382,24 @@ private const val AGC_MIN_GAIN = 0.3
 private const val AGC_MAX_GAIN = 3.0
 /** How fast the AGC gain adapts per frame (small = smooth, no pumping). */
 private const val AGC_ADAPT = 0.08
-/** Soft-limiter ceiling (0-32767). Peaks compress smoothly toward this so the
- *  output never blasts past a reasonable maximum. ~0.8 of full scale. */
-private val LIMITER_CEILING = env("VOICE_CEILING", 26000L).toDouble()
+/** Limiter ceiling (0-32767): output peaks are held below this. ~0.7 of full scale. */
+private val LIMITER_CEILING = env("VOICE_CEILING", 23000L).toDouble()
+// Smoothed peak-limiter coefficients (per sample @ 16 kHz). The peak follower rises
+// fast and falls slowly; the gain is REDUCED (not waveshaped) so tonal / high-pitch
+// content like flutes isn't given harsh harmonics — no "pang" on peaks.
+private const val LIM_ENV_ATTACK = 0.25    // peak follower rise (fast)
+private const val LIM_ENV_RELEASE = 0.0015 // peak follower fall (~slow)
+private const val LIM_GAIN_ATTACK = 0.05   // gain pulls down quickly when peaking
+private const val LIM_GAIN_RELEASE = 0.0004 // gain recovers slowly (~150 ms)
+
+/** Smoothed-limiter state for one listener's downlink (carried across frames). */
+private class Limiter {
+    var env: Double = 0.0
+    var gain: Double = 1.0
+}
+
+/** Per-listener limiter state. */
+private val limiters: MutableMap<String, Limiter> = ConcurrentHashMap()
 
 /**
  * Per-talker automatic gain control: slowly scale each source toward a consistent
@@ -421,15 +436,26 @@ private fun agc(p: Player, src: ByteArray): ByteArray {
 }
 
 /**
- * Soft brick-wall limiter on a mixed PCM frame: tanh-shapes samples toward
- * ±LIMITER_CEILING so loud peaks compress gently (no harsh clipping) and the
- * output can never exceed the ceiling — a safety cap so nobody gets blasted.
+ * Smoothed peak limiter on a mixed PCM frame. A peak follower tracks the signal
+ * envelope (fast attack, slow release); when it exceeds the ceiling the overall
+ * gain is pulled down (and recovers gently) so peaks stay under the ceiling by
+ * *attenuation*, not waveshaping. This avoids the harmonic "pang" an instantaneous
+ * clipper/tanh adds to tonal, high-frequency content (flutes, whistles). State is
+ * per listener so the gain envelope is continuous across frames.
  */
-private fun limit(pcm: ByteArray): ByteArray {
+private fun limit(lim: Limiter, pcm: ByteArray): ByteArray {
     var j = 0
     while (j + 1 < pcm.size) {
         val s = ((pcm[j].toInt() and 0xFF) or (pcm[j + 1].toInt() shl 8)).toDouble()
-        val o = (LIMITER_CEILING * tanh(s / LIMITER_CEILING)).roundToInt().coerceIn(-32768, 32767)
+        val level = abs(s)
+        // Peak follower: rise fast toward new peaks, fall slowly.
+        val envCoef = if (level > lim.env) LIM_ENV_ATTACK else LIM_ENV_RELEASE
+        lim.env += (level - lim.env) * envCoef
+        val target = if (lim.env > LIMITER_CEILING) LIMITER_CEILING / lim.env else 1.0
+        // Reduce gain quickly when peaking, recover slowly — no per-sample distortion.
+        val gainCoef = if (target < lim.gain) LIM_GAIN_ATTACK else LIM_GAIN_RELEASE
+        lim.gain += (target - lim.gain) * gainCoef
+        val o = (s * lim.gain).roundToInt().coerceIn(-32768, 32767)
         pcm[j] = (o and 0xFF).toByte()
         pcm[j + 1] = ((o shr 8) and 0xFF).toByte()
         j += 2
@@ -469,6 +495,7 @@ fun main() {
                     voiceFrames.remove(it)
                     opusDecoders.remove(it)?.close()
                     opusEncoders.remove(it)?.close()
+                    limiters.remove(it)
                 }
                 call.respondText("ok")
             }
@@ -596,8 +623,8 @@ fun main() {
                     }
                     if (slice.isNotEmpty()) out.write(mixPcm16(slice))
                 }
-                // Soft-limit the mix to the ceiling, then Opus-encode this listener's downlink.
-                val mixed = limit(out.toByteArray())
+                // Smoothly limit the mix to the ceiling, then Opus-encode this listener's downlink.
+                val mixed = limit(limiters.getOrPut(listener) { Limiter() }, out.toByteArray())
                 val enc = opusEncoders.getOrPut(listener) { newOpusEncoder() }
                 val body = synchronized(enc) { opusEncode(enc, mixed) }
                 if (body.isEmpty()) {
