@@ -32,7 +32,7 @@ private const val OPUS_SUBFRAME = 320 // samples = 20 ms @ 16 kHz
 
 private fun newOpusEncoder(): OpusEncoder =
     OpusEncoder(OPUS_FS, 1, OpusEncoder.Application.VOIP).apply {
-        setMaxPacketLossPercentage(10f) // bias toward loss-robust encoding
+        setMaxPacketLossPercentage(0.1f) // 10% (opus4j expects a 0..1 fraction) — loss-robust
     }
 
 private fun newOpusDecoder(): OpusDecoder = OpusDecoder(OPUS_FS, 1).apply { setFrameSize(OPUS_SUBFRAME) }
