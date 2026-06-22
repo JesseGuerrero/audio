@@ -1,6 +1,7 @@
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
+import io.ktor.server.application.install
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 import io.ktor.server.request.receiveStream
@@ -11,8 +12,15 @@ import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
+import io.ktor.server.websocket.WebSockets
+import io.ktor.server.websocket.webSocket
+import io.ktor.websocket.Frame
+import io.ktor.websocket.readBytes
 import de.maxhenkel.opus4j.OpusDecoder
 import de.maxhenkel.opus4j.OpusEncoder
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -465,6 +473,76 @@ private fun limit(lim: Limiter, pcm: ByteArray): ByteArray {
     return pcm
 }
 
+/**
+ * Ingest one uploaded voice payload from [name]: Opus-decode → high-pass → gate →
+ * AGC → append to the talker's backlog. Shared by the HTTP POST and the WebSocket
+ * receive path so both behave identically.
+ */
+private fun ingestVoice(name: String, bytes: ByteArray) {
+    if (bytes.isEmpty()) return
+    val dec = opusDecoders.getOrPut(name) { newOpusDecoder() }
+    val pcm = synchronized(dec) { opusDecode(dec, bytes) }
+    if (pcm.isEmpty()) return
+    val clean = agc(player(name), denoise(player(name), pcm))
+    val dq = voiceFrames.getOrPut(name) { ArrayDeque() }
+    synchronized(dq) {
+        dq.addLast(clean to System.currentTimeMillis())
+        while (dq.size > MAX_BACKLOG) dq.removeFirst() // drop oldest
+    }
+}
+
+/**
+ * Build [listener]'s downlink: every audible talker's not-yet-served frames, scaled
+ * by per-listener gain (proximity/clan/mute), mixed per slot, soft-limited, then
+ * Opus-encoded. Returns null when nothing is audible/fresh. Shared by HTTP GET and
+ * the WebSocket send loop. Advances per-listener lastServed, so each frame goes out
+ * exactly once per listener regardless of transport.
+ */
+private fun buildListenerMix(listener: String): ByteArray? {
+    val talkers = audibleTalkers(listener)
+    if (talkers.isEmpty()) return null
+    val now = System.currentTimeMillis()
+    val backlogs = ArrayList<List<ByteArray>>(talkers.size)
+    for ((talker, gain) in talkers) {
+        val dq = voiceFrames[talker.username] ?: continue
+        val key = "$listener|${talker.username}"
+        val since = lastServed[key] ?: 0L
+        val fresh = ArrayList<ByteArray>()
+        var newest = since
+        synchronized(dq) {
+            for ((frame, ts) in dq) {
+                if (ts <= since || now - ts > FRAME_STALE_MS) continue
+                fresh.add(scalePcm16(frame, gain / 100.0))
+                if (ts > newest) newest = ts
+            }
+        }
+        if (fresh.isNotEmpty()) {
+            lastServed[key] = newest
+            backlogs.add(fresh)
+        }
+    }
+    if (backlogs.isEmpty()) return null
+    // Concatenate frame slots; within each slot mix the talkers. Backlogs are
+    // right-aligned (newest frames coincide) so simultaneous talkers stay in sync.
+    val slots = backlogs.maxOf { it.size }
+    val out = ByteArrayOutputStream()
+    for (i in 0 until slots) {
+        val slice = backlogs.mapNotNull { b ->
+            val idx = i - (slots - b.size)
+            if (idx in b.indices) b[idx] else null
+        }
+        if (slice.isNotEmpty()) out.write(mixPcm16(slice))
+    }
+    val mixed = limit(limiters.getOrPut(listener) { Limiter() }, out.toByteArray())
+    val enc = opusEncoders.getOrPut(listener) { newOpusEncoder() }
+    val body = synchronized(enc) { opusEncode(enc, mixed) }
+    return if (body.isEmpty()) null else body
+}
+
+/** How often (ms) each WebSocket listener's downlink is rebuilt and pushed. Small =
+ *  lower latency, more CPU. Tunable via VOICE_WS_TICK. */
+private val WS_TICK_MS = env("VOICE_WS_TICK", 20L)
+
 fun main() {
     val port = env("VOICE_PORT", 8080).toInt()
     val host = cfg("VOICE_HOST") ?: "0.0.0.0"
@@ -472,6 +550,10 @@ fun main() {
     println("[ktor_voice] starting on $host:$port")
 
     embeddedServer(Netty, host = host, port = port) {
+        install(WebSockets) {
+            pingPeriodMillis = 15_000 // keepalive so dead peers are detected
+            timeoutMillis = 15_000
+        }
         routing {
             // Per-tick player state: world, tile, voice level and clan name (?clan=).
             post("/update/{name}/{world}/{x}/{y}/{plane}/{volume}") {
@@ -558,82 +640,42 @@ fun main() {
             post("/voice/{name}") {
                 val name = normalize(call.parameters["name"])
                 val bytes = call.receiveStream().readBytes()
-                if (name != null && bytes.isNotEmpty()) {
-                    // Opus-decode the uplink to PCM, then high-pass + noise-gate it.
-                    val dec = opusDecoders.getOrPut(name) { newOpusDecoder() }
-                    val pcm = synchronized(dec) { opusDecode(dec, bytes) }
-                    if (pcm.isEmpty()) {
-                        call.respondText("ok")
-                        return@post
-                    }
-                    val clean = agc(player(name), denoise(player(name), pcm))
-                    val dq = voiceFrames.getOrPut(name) { ArrayDeque() }
-                    synchronized(dq) {
-                        dq.addLast(clean to System.currentTimeMillis())
-                        while (dq.size > MAX_BACKLOG) dq.removeFirst() // drop oldest
-                    }
-                }
+                if (name != null) ingestVoice(name, bytes)
                 call.respondText("ok")
             }
-            // A listener pulls a single frame mixing EVERY audible talker, each
-            // PCM-scaled by its own per-listener gain (proximity/clan). 204 when
-            // nobody is audible or no talker has a fresh frame to play.
+            // A listener pulls a frame mixing EVERY audible talker, each PCM-scaled by
+            // its own per-listener gain (proximity/clan). 204 when nobody is audible or
+            // no talker has a fresh frame to play.
             get("/voice/{listener}") {
                 val listener = normalize(call.parameters["listener"])
-                val talkers = if (listener == null) emptyList() else audibleTalkers(listener)
-                if (listener == null || talkers.isEmpty()) {
-                    call.respond(HttpStatusCode.NoContent)
-                    return@get
-                }
-                val now = System.currentTimeMillis()
-                // Per talker, every frame this listener hasn't seen yet (and isn't
-                // stale), scaled by that talker's gain — oldest first. Polling slower
-                // than the 100ms upload cadence just yields several frames at once
-                // instead of dropping the ones overwritten between polls.
-                val backlogs = ArrayList<List<ByteArray>>(talkers.size)
-                for ((talker, gain) in talkers) {
-                    val dq = voiceFrames[talker.username] ?: continue
-                    val key = "$listener|${talker.username}"
-                    val since = lastServed[key] ?: 0L
-                    val fresh = ArrayList<ByteArray>()
-                    var newest = since
-                    synchronized(dq) {
-                        for ((frame, ts) in dq) {
-                            if (ts <= since || now - ts > FRAME_STALE_MS) continue
-                            fresh.add(scalePcm16(frame, gain / 100.0))
-                            if (ts > newest) newest = ts
-                        }
-                    }
-                    if (fresh.isNotEmpty()) {
-                        lastServed[key] = newest
-                        backlogs.add(fresh)
-                    }
-                }
-                if (backlogs.isEmpty()) {
-                    call.respond(HttpStatusCode.NoContent)
-                    return@get
-                }
-                // Concatenate frame slots; within each slot mix the talkers. Backlogs
-                // are right-aligned (newest frames coincide) so simultaneous talkers
-                // stay in sync when their backlogs differ in length.
-                val slots = backlogs.maxOf { it.size }
-                val out = ByteArrayOutputStream()
-                for (i in 0 until slots) {
-                    val slice = backlogs.mapNotNull { b ->
-                        val idx = i - (slots - b.size)
-                        if (idx in b.indices) b[idx] else null
-                    }
-                    if (slice.isNotEmpty()) out.write(mixPcm16(slice))
-                }
-                // Smoothly limit the mix to the ceiling, then Opus-encode this listener's downlink.
-                val mixed = limit(limiters.getOrPut(listener) { Limiter() }, out.toByteArray())
-                val enc = opusEncoders.getOrPut(listener) { newOpusEncoder() }
-                val body = synchronized(enc) { opusEncode(enc, mixed) }
-                if (body.isEmpty()) {
+                val body = listener?.let { buildListenerMix(it) }
+                if (body == null) {
                     call.respond(HttpStatusCode.NoContent)
                     return@get
                 }
                 call.respondBytes(body, ContentType.Application.OctetStream)
+            }
+            // Low-latency push transport: one socket per client carries both the mic
+            // uplink (inbound binary = Opus frames) and the mixed downlink (outbound
+            // binary, pushed every WS_TICK_MS as soon as audio is ready) — eliminating
+            // the HTTP poll-wait. The HTTP /voice endpoints above remain as a fallback.
+            webSocket("/ws/voice/{name}") {
+                val name = normalize(call.parameters["name"]) ?: return@webSocket
+                // Push this listener's mix as it becomes available.
+                val sender = launch {
+                    while (isActive) {
+                        val body = buildListenerMix(name)
+                        if (body != null) send(Frame.Binary(true, body))
+                        delay(WS_TICK_MS)
+                    }
+                }
+                try {
+                    for (frame in incoming) {
+                        if (frame is Frame.Binary) ingestVoice(name, frame.readBytes())
+                    }
+                } finally {
+                    sender.cancel()
+                }
             }
             get("/health") {
                 call.respondText("ok")

@@ -18,6 +18,7 @@ val ktorVersion = "2.3.13"
 dependencies {
     implementation("io.ktor:ktor-server-core:$ktorVersion")
     implementation("io.ktor:ktor-server-netty:$ktorVersion")
+    implementation("io.ktor:ktor-server-websockets:$ktorVersion")
     implementation("ch.qos.logback:logback-classic:1.5.6")
     // Native libopus (1.6.x) JNI binding — bundles natives for all platforms.
     implementation("de.maxhenkel.opus4j:opus4j:2.1.0")
